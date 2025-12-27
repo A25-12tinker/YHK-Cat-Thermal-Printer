@@ -1,142 +1,157 @@
+#!/usr/bin/env python3
+import os
 import socket
-import PIL.Image
-import PIL.ImageDraw
-import PIL.ImageFont
-import PIL.ImageChops
-import PIL.ImageOps
-from time import sleep
 import struct
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from PIL import Image, ImageTk, ImageOps
+from time import sleep
 
-
-printerMACAddress = 'XX:XX:XX:XX:XX:XX'
-printerWidth = 384
-port = 2
-
+PREVIEW_WIDTH = 384
+PRINTER_WIDTH = 384
+ENV_MAC = "THERMAL_PRINTER_MAC"
 
 def initilizePrinter(soc):
     soc.send(b"\x1b\x40")
-    
-def getPrinterStatus(soc):
-    soc.send(b"\x1e\x47\x03")
-    return soc.recv(38) 
-    
-def getPrinterSerialNumber(soc):
-    soc.send(b"\x1D\x67\x39")
-    return soc.recv(21)
-    
-def getPrinterProductInfo(soc):
-    soc.send(b"\x1d\x67\x69")
-    return soc.recv(16)
-    
+
 def sendStartPrintSequence(soc):
-    soc.send(b"\x1d\x49\xf0\x19")   
-  
+    soc.send(b"\x1d\x49\xf0\x19")
+
 def sendEndPrintSequence(soc):
     soc.send(b"\x0a\x0a\x0a\x0a")
-    
-    
-def trimImage(im):
-    bg = PIL.Image.new(im.mode, im.size, (255,255,255))
-    diff = PIL.ImageChops.difference(im, bg)
-    diff = PIL.ImageChops.add(diff, diff, 2.0)
-    bbox = diff.getbbox()
-    if bbox:
-        return im.crop((bbox[0],bbox[1],bbox[2],bbox[3]+10)) # don't cut off the end of the image
 
-def create_text(text, font_name="Lucon.ttf", font_size=12):
-    img = PIL.Image.new('RGB', (printerWidth, 5000), color = (255, 255, 255))
-    font = PIL.ImageFont.truetype(font_name, font_size)
-    
-    d = PIL.ImageDraw.Draw(img)
-    lines = []
-    for line in text.splitlines():
-        lines.append(get_wrapped_text(line, font, printerWidth))
-    lines = "\n".join(lines)
-    d.text((0,0), lines, fill=(0,0,0), font=font)
-    return trimImage(img)
+def printImage(mac, port, image_path, status_cb):
+    try:
+        status_cb("Connecting...")
+        s = socket.socket(
+            socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM
+        )
+        s.connect((mac, port))
+        status_cb("Processing...")
 
-def get_wrapped_text(text: str, font: PIL.ImageFont.ImageFont,
-                     line_length: int):
-    lines = ['']
-    for word in text.split():
-        line = f'{lines[-1]} {word}'.strip()
-        if font.getlength(line) <= line_length:
-            lines[-1] = line
-        else:
-            lines.append(word)
-    return '\n'.join(lines)
+        im = Image.open(image_path)
+        if im.width > PRINTER_WIDTH:
+            h = int(im.height * (PRINTER_WIDTH / im.width))
+            im = im.resize((PRINTER_WIDTH, h))
+        if im.width < PRINTER_WIDTH:
+            padded = Image.new("1", (PRINTER_WIDTH, im.height), 1)
+            padded.paste(im)
+            im = padded
 
+        im = im.rotate(180)
+        if im.mode != "1":
+            im = im.convert("1")
+        if im.width % 8:
+            im2 = Image.new(
+                "1", (im.width + 8 - im.width % 8, im.height), 1
+            )
+            im2.paste(im)
+            im = im2
+        im = ImageOps.invert(im.convert("L")).convert("1")
 
-def printImage(soc, im):
-    if im.width > printerWidth:
-        # image is wider than printer resolution; scale it down proportionately
-        height = int(im.height * (printerWidth / im.width))
-        im = im.resize((printerWidth, height))
-        
-    if im.width < printerWidth:
-        # image is narrower than printer resolution; pad it out with white pixels
-        padded_image = PIL.Image.new("1", (printerWidth, im.height), 1)
-        padded_image.paste(im)
-        im = padded_image
-        
-    
-    im = im.rotate(180) #print it so it looks right when spewing out of the mouth
-    
-    # if image is not 1-bit, convert it
-    if im.mode != '1':
-        im = im.convert('1')
-        
-        
-    # if image width is not a multiple of 8 pixels, fix that
-    if im.size[0] % 8:
-        im2 = Image.new('1', (im.size[0] + 8 - im.size[0] % 8, 
-                        im.size[1]), 'white')
-        im2.paste(im, (0, 0))
-        im = im2
-        
-        
-        
-    # Invert image, via greyscale for compatibility
-    #  (no, I don't know why I need to do this)
-    im = PIL.ImageOps.invert(im.convert('L'))
-    # ... and now convert back to single bit
-    im = im.convert('1')
+        buf = b"".join((
+            b"\x1d\x76\x30\x00",
+            struct.pack(
+                "2B", int(im.width / 8 % 256), int(im.width / 8 / 256)
+            ),
+            struct.pack("2B", int(im.height % 256), int(im.height / 256)),
+            im.tobytes()
+        ))
 
-    buf = b''.join((bytearray(b'\x1d\x76\x30\x00'), 
-                                          struct.pack('2B', int(im.size[0] / 8 % 256), 
-                                                      int(im.size[0] / 8 / 256)), 
-                                                      struct.pack('2B', int(im.size[1] % 256), 
-                                                                  int(im.size[1] / 256)), 
-                                                                  im.tobytes()))
-    initilizePrinter(soc)  
-    sleep(.5)    
-    sendStartPrintSequence(soc)
-    sleep(.5)
-    soc.send(buf)
-    sleep(.5)
-    sendEndPrintSequence(soc)
-    sleep(.5)
+        status_cb("Printing...")
+        initilizePrinter(s)
+        sleep(0.3)
+        sendStartPrintSequence(s)
+        sleep(0.3)
+        s.send(buf)
+        sleep(0.3)
+        sendEndPrintSequence(s)
+        s.close()
+        status_cb("Done")
+    except Exception as e:
+        status_cb(f"Error: {e}")
 
+class PrinterGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("YHK Cat Thermal Printer")
+        self.geometry("500x700")
+        self.image_path = None
+        self.preview_img = None
 
-s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
-s.connect((printerMACAddress,port))
+        instructions = (
+            "#sh \n"
+            "sdptool add --channel=N SP #modify N\n"
+            "sudo rfcomm bind N xx:xx:xx:xx:xx:xx #mod.y N and xx:..."
+        )
+        self.text_instructions = tk.Text(self, height=3, wrap="word")
+        self.text_instructions.insert("1.0", instructions)
+        self.text_instructions.configure(state="normal")  # można kopiować
+        self.text_instructions.pack(fill="x", padx=10, pady=10)
 
-print("Connecting to printer...")
-getPrinterStatus(s)
-sleep(0.5)
-getPrinterSerialNumber(s)
-sleep(0.5)
-getPrinterProductInfo(s)
-sleep(0.5)
+        tk.Label(self, text="MAC:").pack(anchor="w", padx=10, pady=(10, 0))
+        self.mac_var = tk.StringVar(value=os.environ.get(ENV_MAC, ""))
+        tk.Entry(self, textvariable=self.mac_var).pack(fill="x", padx=10)
 
-#Read Image File
-img = PIL.Image.open("Turtle.jpg")
+        tk.Label(self, text="RFCOMM Port:").pack(anchor="w", padx=10, pady=(10, 0))
+        self.port_var = tk.StringVar(value="2")
+        tk.Entry(self, textvariable=self.port_var).pack(fill="x", padx=10)
 
-#Create image from text
-#text = "Line 1\nLine 2\nLine 3"
-#img = create_text(text,font_size=65)
+        frame = tk.Frame(self)
+        frame.pack(padx=10, pady=10, fill="both", expand=True)
+        self.canvas = tk.Canvas(frame, width=PREVIEW_WIDTH)
+        scrollbar = tk.Scrollbar(frame, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
 
+        tk.Button(self, text="Select picture", command=self.choose_image).pack(pady=5)
+        tk.Button(self, text="Print", command=self.print_image).pack(pady=5)
 
-printImage(s,img)
-s.close()
+        self.status_var = tk.StringVar(value="Ready")
+        tk.Label(
+            self, textvariable=self.status_var, relief="sunken", anchor="w"
+        ).pack(side="bottom", fill="x")
+
+    def set_status(self, msg):
+        self.status_var.set(msg)
+        self.update_idletasks()
+
+    def choose_image(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Pictures", "*.png *.jpg *.jpeg *.bmp")]
+        )
+        if not path:
+            return
+        self.image_path = path
+        img = Image.open(path)
+        ratio = PREVIEW_WIDTH / img.width
+        img = img.resize((PREVIEW_WIDTH, int(img.height * ratio)))
+        self.preview_img = ImageTk.PhotoImage(img)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=self.preview_img)
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self.set_status("Picture loaded")
+
+    def print_image(self):
+        if not self.image_path:
+            messagebox.showwarning("No picture", "Select picture to print")
+            return
+        mac = self.mac_var.get()
+        if not mac:
+            messagebox.showwarning("No MAC", "Input MAC address")
+            return
+        try:
+            port = int(self.port_var.get())
+        except ValueError:
+            messagebox.showwarning("Invalid port", "RFCOMM port must be a number")
+            return
+        threading.Thread(
+            target=printImage, args=(mac, port, self.image_path, self.set_status), daemon=True
+        ).start()
+
+if __name__ == "__main__":
+    app = PrinterGUI()
+    app.mainloop()
 
